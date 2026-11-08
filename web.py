@@ -75,6 +75,16 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             msg = parse_qs(url.query).get("msg", [""])[0]
             self.send(200, self.page(msg))
+        elif url.path == "/ntfy":
+            topic = self.bot.load_settings()["ntfy_topic"]
+            server = self.bot.load_settings()["ntfy_server"].rstrip("/")
+            body = (f"<p>1. App „ntfy“ aus dem App Store bzw. Play Store installieren.</p>"
+                    f"<p>2. In der App auf + tippen und dieses Topic abonnieren:</p><p><b>{esc(topic)}</b></p>"
+                    f"<p>Oder direkt öffnen: <a href='{esc(server)}/{esc(topic)}'>{esc(server)}/{esc(topic)}</a></p>"
+                    if topic else "<p>Noch kein Topic eingetragen.</p>")
+            self.send(200, f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                           f"<title>ntfy abonnieren</title><style>{CSS}</style><main><h1>Benachrichtigungen aufs Handy</h1>"
+                           f"<section>{body}</section><a href=/>zurück</a></main>")
         elif url.path == "/screenshot":
             shots = sorted(self.bot.DEBUG.glob("*.png"), key=lambda p: p.stat().st_mtime)
             if shots:
@@ -192,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
 <div><label>Wiederholungen</label><input name=max_retries type=number min=0 max=5 value="{esc(cfg['max_retries'])}"></div>
 <div><label>ntfy-Topic</label><input name=ntfy_topic value="{topic}" autocomplete=off></div>
 <div><label>Erfolg melden</label><input type=checkbox name=notify_success {checked}></div></div>
-<div class=row><button class=pri>Speichern</button></div></form></section>
+<div class=row><button class=pri>Speichern</button><a href=/ntfy><button type=button>Aufs Handy abonnieren</button></a></div></form></section>
 <section><details><summary class=mut>Log (letzte 30 Zeilen)</summary><pre>{esc(log_tail)}</pre></details></section>
 </main></body></html>"""
 
