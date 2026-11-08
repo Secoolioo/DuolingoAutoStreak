@@ -10,6 +10,7 @@ Unterbefehle:
   explore   Erkundung: Seite, Lesson-Start und Netzwerk mitschneiden
 """
 import argparse
+import base64
 import datetime as dt
 import fcntl
 import json
@@ -19,8 +20,8 @@ import os
 import random
 import re
 import sys
+import threading
 import time
-import tomllib
 import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,13 +32,14 @@ LOGS = HERE / "logs"
 DEBUG = HERE / "debug"
 SESSION = DATA / "session.json"
 STATE = DATA / "state.json"
-CONFIG = DATA / "config.toml"
+SETTINGS = DATA / "settings.json"
+CONTROL = DATA / "control.json"
 TZ = ZoneInfo("Europe/Berlin")
 
-WINDOW_START = dt.time(3, 0)
-WINDOW_END = dt.time(22, 0)
-LAST_CHANCE = dt.time(23, 0)
-MAX_RETRIES = 3
+# Über die Weboberfläche änderbar, gespeichert in data/settings.json
+DEFAULTS = {"window_start": "03:00", "window_end": "22:00", "last_chance": "23:00", "max_retries": 3,
+            "notify_success": True, "ntfy_server": "https://ntfy.sh", "ntfy_topic": "",
+            "web_host": "0.0.0.0", "web_port": 8095}
 RETRY_GAP_MIN = (15, 75)
 MAX_SCREENSHOTS = 20
 VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1600, 900), (1920, 1080)]
@@ -86,21 +88,25 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
-def load_config():
-    try:
-        return tomllib.loads(CONFIG.read_text())
-    except FileNotFoundError:
-        return {}
+def load_settings():
+    return {**DEFAULTS, **load_json(SETTINGS, {})}
+
+
+def send_control(**cmd):
+    """Befehl an die laufende Hauptschleife (Weboberfläche, Kommandozeile)."""
+    ctl = load_json(CONTROL, {})
+    ctl.update(cmd)
+    save_json(CONTROL, ctl)
 
 
 # ---------------------------------------------------------------- Benachrichtigung
 
 def notify(title, message, priority="default", tags="", image=None):
-    topic = load_config().get("ntfy", {}).get("topic")
+    cfg = load_settings()
+    topic, server = cfg["ntfy_topic"], cfg["ntfy_server"].rstrip("/")
     if not topic:
         log.warning("Kein ntfy-Topic konfiguriert, Meldung nur im Log: %s – %s", title, message)
         return
-    server = load_config()["ntfy"].get("server", "https://ntfy.sh")
     headers = {"Title": title.encode("utf-8"), "Priority": priority, "Tags": tags}
     if image and Path(image).exists():
         headers["Filename"] = Path(image).name
@@ -118,19 +124,19 @@ def notify(title, message, priority="default", tags="", image=None):
 
 # ---------------------------------------------------------------- Zeitplan
 
-def pick_time(day, avoid_minute=None, rng=random):
-    """Gleichverteilte Zeit zwischen 03:00 und 22:00, auf die Sekunde, nie dieselbe Minute wie gestern."""
-    start = dt.datetime.combine(day, WINDOW_START, TZ)
-    span = int((dt.datetime.combine(day, WINDOW_END, TZ) - start).total_seconds())
+def pick_time(day, cfg, avoid_minute=None, rng=random):
+    """Gleichverteilte Zeit im Fenster (Standard 03:00–22:00), auf die Sekunde, nie dieselbe Minute wie gestern."""
+    start = dt.datetime.combine(day, dt.time.fromisoformat(cfg["window_start"]), TZ)
+    span = int((dt.datetime.combine(day, dt.time.fromisoformat(cfg["window_end"]), TZ) - start).total_seconds())
     while True:
         t = start + dt.timedelta(seconds=rng.randrange(span))
         if t.strftime("%H:%M") != avoid_minute:
             return t
 
 
-def retry_time(after, attempts_left, rng=random):
-    """Nächster Versuch nach 15–75 min, gestaucht, damit alle Versuche bis 23:00 passen."""
-    last = dt.datetime.combine(after.date(), LAST_CHANCE, TZ)
+def retry_time(after, attempts_left, cfg, rng=random):
+    """Nächster Versuch nach 15–75 min, gestaucht, damit alle Versuche bis zur letzten Chance (23:00) passen."""
+    last = dt.datetime.combine(after.date(), dt.time.fromisoformat(cfg["last_chance"]), TZ)
     room = (last - after).total_seconds() / 60
     if room < 1:
         return None
@@ -143,7 +149,7 @@ def plan_day(state, day):
     """Legt den Tagesplan an, falls für `day` noch keiner existiert."""
     if state.get("day") == str(day):
         return
-    t = pick_time(day, state.get("planned_minute"))
+    t = pick_time(day, load_settings(), state.get("planned_minute"))
     state["planned_minute"] = t.strftime("%H:%M")
     if now() > t:  # Dienst lief zur geplanten Zeit nicht (Neustart) – bald nachholen
         t = now() + dt.timedelta(seconds=random.randint(120, 900))
@@ -153,14 +159,15 @@ def plan_day(state, day):
 
 def cmd_plan(args):
     rng = random.Random(args.seed)
+    cfg = load_settings()
     prev = None
     day = now().date()
     for _ in range(args.days):
-        t = pick_time(day, prev, rng)
+        t = pick_time(day, cfg, prev, rng)
         retries = []
         cur = t
-        for left in range(MAX_RETRIES, 0, -1):
-            cur = retry_time(cur, left, rng)
+        for left in range(cfg["max_retries"], 0, -1):
+            cur = retry_time(cur, left, cfg, rng)
             if cur is None:
                 break
             retries.append(cur.strftime("%H:%M"))
@@ -252,17 +259,23 @@ def human_type(page, text):
 # ---------------------------------------------------------------- Erkennung
 
 LOGIN_URL = re.compile(r"duolingo\.com/(log-in|login|register|\?isLoggingIn)")
-SECURITY_TEXT = re.compile(r"captcha|recaptcha|hcaptcha|arkose|funcaptcha|verify you are human|"
-                           r"bist du ein mensch|sicherheitsüberprüfung|unusual activity|ungewöhnliche aktivität",
-                           re.I)
+SECURITY_TEXT = re.compile(r"verify you are human|are you a robot|press and hold|bist du ein mensch|"
+                           r"sicherheitsüberprüfung|unusual activity|ungewöhnliche aktivität", re.I)
 SECURITY_FRAMES = re.compile(r"recaptcha|hcaptcha|arkoselabs|funcaptcha|challenges\.cloudflare", re.I)
 
 
 def check_blockers(page):
     if LOGIN_URL.search(page.url):
         raise LoginRequired(f"Login-Seite erschienen ({page.url})")
-    if any(SECURITY_FRAMES.search(f.url or "") for f in page.frames):
-        raise SecurityCheck("Captcha-Frame auf der Seite")
+    # Duolingo lädt auf jeder Seite ein unsichtbares reCAPTCHA – nur ein sichtbares ist eine Abfrage
+    for frame in page.frames:
+        if frame.parent_frame and SECURITY_FRAMES.search(frame.url or ""):
+            try:
+                shown = frame.frame_element().is_visible()
+            except Exception:
+                shown = False
+            if shown:
+                raise SecurityCheck(f"sichtbares Captcha ({frame.url.split('?')[0]})")
     try:
         body = page.locator("body").inner_text(timeout=3000)
     except Exception:
@@ -320,20 +333,269 @@ def cmd_explore(args):
 
 # ---------------------------------------------------------------- Lesson
 
-def do_lesson(page):
-    """Wird nach dem Erkundungslauf implementiert."""
-    raise NotImplementedError
+LESSON_URL = "https://www.duolingo.com/lesson"
+MAX_STEPS = 45
+MAX_LESSON_S = 420
+SESSION_API = re.compile(r"duolingo\.com/\d{4}-\d{2}-\d{2}/sessions$")
+SESSION_DONE = re.compile(r"duolingo\.com/\d{4}-\d{2}-\d{2}/sessions/[A-Za-z0-9_-]+$")
+CANT_DO = re.compile(r"can.?t (listen|speak|hear) now|kann gerade nicht|jetzt nicht (sprechen|zuhören|hören)", re.I)
+DISMISS = re.compile(r"^\s*(no thanks|not now|maybe later|later|got it|nein,? danke|nicht jetzt|vielleicht später|"
+                     r"später|verstanden)\s*$", re.I)
+FINISH = re.compile(r"^\s*(continue|claim xp|weiter|xp einsammeln|ok)\s*$", re.I)
+BANK = '[data-test="word-bank"] [data-test$="challenge-tap-token"]'
+TOKEN = '[data-test$="challenge-tap-token"]'
+
+READ_CHALLENGE = """() => {
+  const ch = document.querySelector('[data-test~="challenge"]');
+  if (!ch) return null;
+  const type = (ch.getAttribute('data-test').split(' ').find(t => t.startsWith('challenge-')) || '').slice(10);
+  const txt = e => (e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e)
+                     .innerText.trim().split('\\n').pop();
+  // Die Aufgabe samt Lösung hängt als Prop am React-Baum der Aufgabe
+  const fk = Object.keys(ch).find(k => k.startsWith('__reactFiber$'));
+  const solved = v => v && typeof v === 'object' && !Array.isArray(v) && v.type &&
+    ['correctSolutions', 'correctIndex', 'correctIndices', 'correctTokens', 'pairs'].some(k => k in v);
+  let data = null;
+  for (let f = fk && ch[fk], d = 0; f && d < 40 && !data; d++, f = f.return) {
+    const hit = Object.values(f.memoizedProps || {}).find(solved);
+    if (hit) {
+      data = {};
+      for (const k of ['type', 'prompt', 'choices', 'correctIndex', 'correctIndices', 'correctTokens',
+                       'correctSolutions', 'pairs']) if (k in hit) data[k] = hit[k];
+      data = JSON.parse(JSON.stringify(data));
+    }
+  }
+  return {type, data, text: ch.innerText,
+          bank: [...document.querySelectorAll('[data-test="word-bank"] [data-test$="challenge-tap-token"]')].map(txt),
+          tokens: [...document.querySelectorAll('[data-test$="challenge-tap-token"]')].map(txt),
+          choices: [...document.querySelectorAll('[data-test="challenge-choice"]')].map(txt),
+          input: !!ch.querySelector('textarea, input[type="text"]')};
+}"""
+
+
+def option_texts(ch):
+    out = []
+    for c in ch.get("choices") or []:
+        out.append(c if isinstance(c, str) else c.get("text", ""))
+    return out
+
+
+class ChallengeBank:
+    """Sammelt die Aufgaben samt Lösungen aus den Session-Antworten, die die Web-App selbst lädt."""
+
+    def __init__(self, page):
+        self.items = []
+        self.submitted = False
+        page.on("response", self._on_response)
+        page.on("request", self._on_request)
+
+    def _on_request(self, req):
+        # Abschluss einer Lesson: die App schickt die Session an /<version>/sessions/<id>
+        if req.method in ("PUT", "POST") and SESSION_DONE.search(req.url.split("?")[0]):
+            self.submitted = True
+            log.info("Lesson an Duolingo übermittelt (%s)", req.method)
+
+    def _on_response(self, resp):
+        if resp.request.method != "POST" or not SESSION_API.search(resp.url.split("?")[0]):
+            return
+        try:
+            self._collect(resp.json())
+        except Exception:
+            pass
+
+    def _collect(self, node):
+        if isinstance(node, dict):
+            if "type" in node and "id" in node and any(k in node for k in ("prompt", "choices", "pairs")):
+                self.items.append(node)
+            for v in node.values():
+                self._collect(v)
+        elif isinstance(node, list):
+            for v in node:
+                self._collect(v)
+
+    def find(self, dom):
+        best, best_score = None, 0
+        for ch in reversed(self.items):
+            if ch.get("type") != dom["type"]:
+                continue
+            score, opts = 0, option_texts(ch)
+            if isinstance(ch.get("prompt"), str) and ch["prompt"] and ch["prompt"] in dom["text"]:
+                score += 3
+            if opts and dom["bank"] and sorted(opts) == sorted(dom["bank"]):
+                score += 3
+            if opts and dom["choices"] and sorted(opts) == sorted(dom["choices"]):
+                score += 3
+            words = {w for p in ch.get("pairs") or [] for w in p.values() if isinstance(w, str)}
+            if words and dom["tokens"] and set(dom["tokens"]) <= words:
+                score += 3
+            if score > best_score:
+                best, best_score = ch, score
+        return best
+
+
+def visible(locator):
+    try:
+        return locator.count() > 0 and locator.first.is_visible()
+    except Exception:
+        return False
+
+
+def click_text(page, selector, text):
+    """Klickt das erste freie Element mit genau diesem Text."""
+    loc = page.locator(selector).filter(has_text=re.compile(rf"^\s*{re.escape(text)}\s*$"))
+    for i in range(loc.count()):
+        el = loc.nth(i)
+        if el.is_visible() and el.is_enabled() and el.get_attribute("aria-disabled") != "true":
+            move_and_click(page, el)
+            time.sleep(random.uniform(0.4, 1.2))
+            return True
+    raise RuntimeError(f"Element mit Text {text!r} nicht gefunden")
+
+
+def click_next(page, timeout=6000):
+    btn = page.locator('[data-test="player-next"]')
+    try:
+        btn.wait_for(state="visible", timeout=timeout)
+        deadline = time.time() + timeout / 1000
+        while not btn.is_enabled() and time.time() < deadline:
+            time.sleep(0.3)
+        if btn.is_enabled():
+            move_and_click(page, btn)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def dismiss_popups(page):
+    pop = page.locator('[data-test="intro-popover"]')
+    if visible(pop):
+        page.keyboard.press("Escape")
+        time.sleep(0.5)
+    buttons = page.get_by_role("button", name=DISMISS)
+    if visible(buttons):
+        log.info("Pop-up weggeklickt: %s", buttons.first.inner_text().strip())
+        move_and_click(page, buttons.first)
+        human_pause(0.6, 1.5)
+
+
+def answer(page, dom, ch):
+    """Löst die aktuelle Aufgabe. Gibt eine kurze Beschreibung zurück."""
+    t = dom["type"]
+    cant = page.get_by_role("button", name=CANT_DO)
+    if visible(cant):
+        move_and_click(page, cant.first)
+        return "abgeschaltet (kann gerade nicht)"
+    if ch is None:
+        move_and_click(page, page.locator('[data-test="player-skip"]'))
+        return "übersprungen (keine Lösung gefunden)"
+    if ch.get("pairs"):
+        for p in ch["pairs"]:
+            a = p.get("learningToken") or p.get("learningWord")
+            b = p.get("fromToken") or p.get("translation")
+            click_text(page, TOKEN, a)
+            click_text(page, TOKEN, b)
+        return "Paare zugeordnet"
+    if dom["bank"]:
+        opts = option_texts(ch)
+        order = [opts[i] for i in ch["correctIndices"]] if ch.get("correctIndices") else ch.get("correctTokens", [])
+        for word in order:
+            human_pause(0.3, 1.2)
+            click_text(page, BANK, word)
+        return "Wortbank: " + " ".join(order)
+    if dom["choices"] and ch.get("correctIndex") is not None:
+        target = option_texts(ch)[ch["correctIndex"]]
+        click_text(page, '[data-test="challenge-choice"]', target)
+        return f"Auswahl: {target}"
+    if dom["input"]:
+        text = (ch.get("correctSolutions") or [ch.get("prompt", "")])[0]
+        move_and_click(page, page.locator('[data-test~="challenge"] textarea, [data-test~="challenge"] input[type="text"]').first)
+        human_type(page, text)
+        return f"getippt: {text}"
+    move_and_click(page, page.locator('[data-test="player-skip"]'))
+    return "übersprungen (unbekannte Form)"
+
+
+def do_lesson(page, bank, done_before=False):
+    """Startet die nächste Lesson und löst sie mit den Lösungen aus der Seite bzw. den Session-Daten."""
+    page.goto(LESSON_URL, wait_until="domcontentloaded")
+    started = time.time()
+    last_id = None
+    unknown = answered = 0
+    for step in range(MAX_STEPS):
+        if time.time() - started > MAX_LESSON_S:
+            raise RuntimeError(f"Lesson nach {MAX_LESSON_S} s nicht fertig")
+        page.wait_for_timeout(random.randint(1500, 2800))
+        check_blockers(page)
+        if not re.search(r"/(lesson|practice)", page.url):
+            log.info("Lesson beendet nach %d Schritten (%s)", step, page.url)
+            return
+        dismiss_popups(page)
+        dom = page.evaluate(READ_CHALLENGE)
+        if dom and dom["type"]:
+            ch = dom["data"] if dom["data"] and dom["data"].get("type") == dom["type"] else bank.find(dom)
+            key = (dom["type"], dom["text"][:80])
+            if key == last_id and ch is not None:
+                log.warning("Aufgabe wiederholt sich – überspringe")
+                ch = None
+            last_id = key
+            if ch is None and not visible(page.get_by_role("button", name=CANT_DO)):
+                unknown += 1
+                if unknown >= 3:
+                    raise RuntimeError(f"Dreimal in Folge keine Lösung gefunden (zuletzt {dom['type']})")
+            else:
+                unknown = 0
+            human_pause()
+            what = answer(page, dom, ch)
+            human_pause(0.5, 1.5)
+            click_next(page, 3000)  # Prüfen (bei Paaren evtl. nicht nötig)
+            page.wait_for_timeout(random.randint(900, 1600))
+            verdict = "richtig" if visible(page.locator('[data-test*="blame-correct"]')) else \
+                      "falsch" if visible(page.locator('[data-test*="blame-incorrect"]')) else "?"
+            log.info("Schritt %d %s: %s → %s", step, dom["type"], what, verdict)
+            answered += 1
+            click_next(page, 4000)  # Weiter
+            continue
+        # Kein Aufgaben-Element: Zwischen- oder Abschlussbildschirm. Ist der Tag gebucht, sind wir fertig –
+        # danach folgen nur noch Werbe- und Auswahlbildschirme, die wir gar nicht erst anklicken.
+        if answered and (bank.submitted or (not done_before and read_streak(page)[1])):
+            log.info("Lesson fertig nach %d Aufgaben", answered)
+            return
+        if not click_next(page, 2500):
+            finish = page.get_by_role("button", name=FINISH)
+            if visible(finish):
+                move_and_click(page, finish.first)
+            else:
+                log.info("Schritt %d: nichts anklickbar (%s)", step, page.url)
+    raise RuntimeError(f"Lesson nach {MAX_STEPS} Schritten nicht fertig")
+
+
+STREAK_JS = """async ([id, jwt]) => {
+  const r = await fetch(`/2023-05-23/users/${id}?fields=streak,streakData`,
+                        {headers: {Authorization: `Bearer ${jwt}`}, credentials: 'include'});
+  return [r.status, await r.text()];
+}"""
 
 
 def read_streak(page):
-    """Wird nach dem Erkundungslauf implementiert: (Streak-Zahl, heute erledigt?)."""
-    raise NotImplementedError
+    """(Streak-Zahl, heute erledigt?) über dieselbe API, die die Web-App nutzt."""
+    jwt = next((c["value"] for c in page.context.cookies() if c["name"] == "jwt_token"), None)
+    if not jwt:
+        raise LoginRequired("kein jwt_token-Cookie")
+    uid = json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))["sub"]
+    status, text = page.evaluate(STREAK_JS, [uid, jwt])
+    if status in (401, 403):
+        raise LoginRequired(f"API antwortet {status}")
+    data = json.loads(text)
+    current = (data.get("streakData") or {}).get("currentStreak") or {}
+    return data.get("streak", 0), current.get("endDate") == str(now().date())
 
 
 def run_once(state, force=False):
     """Ein kompletter Versuch. Gibt die Streak-Zahl zurück oder wirft eine Ausnahme."""
     b = Browser(state)
     page = b.page
+    bank = ChallengeBank(page)  # vor dem ersten Aufruf, denn /learn lädt die Lessons vorab
     shot = None
     try:
         page.goto("https://www.duolingo.com/learn", wait_until="domcontentloaded")
@@ -343,10 +605,13 @@ def run_once(state, force=False):
         if done_today and not force:
             log.info("Streak heute schon erledigt (%s Tage) – überspringe", streak)
             return streak, True
-        do_lesson(page)
-        page.goto("https://www.duolingo.com/learn", wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(4000, 7000))
-        streak, done_today = read_streak(page)
+        do_lesson(page, bank, done_today)
+        for _ in range(3):  # der Server bucht die Streak manchmal mit kurzer Verzögerung
+            page.goto("https://www.duolingo.com/learn", wait_until="domcontentloaded")
+            page.wait_for_timeout(random.randint(4000, 7000))
+            streak, done_today = read_streak(page)
+            if done_today:
+                break
         if not done_today:
             raise RuntimeError(f"Lesson durchgelaufen, aber Streak zeigt heute nicht erledigt ({streak})")
         return streak, False
@@ -360,28 +625,44 @@ def run_once(state, force=False):
 
 # ---------------------------------------------------------------- Dienst
 
-def attempt(state):
-    """Ein Versuch samt Zustandsführung und Benachrichtigung."""
-    state["attempts"] += 1
+def record(state, result, detail="", streak=None):
+    """Verlauf für die Weboberfläche (letzte 60 Einträge)."""
+    if streak is not None:
+        state["last_streak"] = streak
+    state.setdefault("history", []).append(
+        {"ts": now().isoformat(timespec="seconds"), "result": result, "detail": detail, "streak": streak})
+    state["history"] = state["history"][-60:]
+
+
+def attempt(state, force=False):
+    """Ein Versuch samt Zustandsführung, Verlauf und Benachrichtigung."""
+    cfg = load_settings()
+    retries = int(cfg["max_retries"])
+    state["attempts"] = state.get("attempts", 0) + 1
     n = state["attempts"]
-    log.info("Versuch %d/%d", n, MAX_RETRIES + 1)
+    log.info("Versuch %d/%d", n, retries + 1)
+    state["running"] = now().isoformat(timespec="seconds")
+    save_json(STATE, state)
     try:
-        streak, skipped = run_once(state)
+        streak, skipped = run_once(state, force)
     except LoginRequired as e:
         log.error("Login nötig: %s", e)
+        record(state, "login", str(e))
         state.update(gave_up=True, login_required=True, session_mtime=SESSION.stat().st_mtime if SESSION.exists() else 0)
         notify("Duolingo: neu einloggen", "Die Session ist abgelaufen. Am PC login.py ausführen (siehe README).",
                "high", "key", getattr(e, "screenshot", None))
         return
     except SecurityCheck as e:
         log.error("Sicherheitsabfrage: %s", e)
+        record(state, "captcha", str(e))
         state.update(gave_up=True, paused=True, pause_reason=str(e))
-        notify("Duolingo: Captcha – Bot pausiert", f"{e}. Kein weiterer Versuch. Fortsetzen: bot.py resume",
+        notify("Duolingo: Captcha – Bot pausiert", f"{e}. Kein weiterer Versuch. Fortsetzen über die Weboberfläche.",
                "urgent", "warning", getattr(e, "screenshot", None))
         return
     except Exception as e:
         log.exception("Versuch %d fehlgeschlagen", n)
-        nxt = retry_time(now(), MAX_RETRIES + 1 - n) if n <= MAX_RETRIES else None
+        record(state, "fehler", f"{type(e).__name__}: {e}")
+        nxt = retry_time(now(), retries + 1 - n, cfg) if n <= retries else None
         if nxt:
             state["next_run"] = nxt.isoformat()
             notify(f"Duolingo: Versuch {n} fehlgeschlagen", f"{type(e).__name__}: {e}\nNächster Versuch {nxt:%H:%M}.",
@@ -392,31 +673,63 @@ def attempt(state):
         msg = f"Alle Versuche heute gescheitert. Letzter Fehler: {type(e).__name__}: {e}"
         if state["failed_days"] >= 2:
             state.update(paused=True, pause_reason="zwei Tage in Folge gescheitert")
-            msg += "\nZwei Tage in Folge – Bot pausiert. Fortsetzen: bot.py resume"
+            msg += "\nZwei Tage in Folge – Bot pausiert. Fortsetzen über die Weboberfläche."
         else:
             msg += "\nNeuer Anlauf morgen."
         notify("Duolingo: Streak in Gefahr", msg, "urgent", "rotating_light", getattr(e, "screenshot", None))
         return
+    finally:
+        state["running"] = None
     state.update(done=True, failed_days=0)
-    if not skipped:
+    record(state, "übersprungen" if skipped else "ok", "heute schon erledigt" if skipped else "Lesson erledigt", streak)
+    if not skipped and cfg["notify_success"]:
         notify("Duolingo: Streak gesichert", f"Lesson erledigt. Streak: {streak} Tage.", "low", "fire")
 
 
+def apply_control(state):
+    """Übernimmt Befehle aus data/control.json. Gibt True zurück, wenn ein Lauf angefordert ist."""
+    ctl = load_json(CONTROL, None)
+    if not ctl:
+        return False
+    CONTROL.unlink(missing_ok=True)
+    if ctl.get("pause") is True:
+        state.update(paused=True, pause_reason="manuell pausiert")
+        log.info("Pausiert (manuell)")
+    elif ctl.get("pause") is False:
+        state.update(paused=False, pause_reason=None, failed_days=0, login_required=False)
+        ctl["replan"] = True
+        log.info("Fortgesetzt")
+    if ctl.get("replan") and not state.get("done"):
+        state["day"] = None  # Tagesplan mit den aktuellen Einstellungen neu würfeln
+    return bool(ctl.get("run"))
+
+
 def cmd_serve(args):
+    import web
+    wake = threading.Event()
+    web.start(sys.modules[__name__], wake)
     log.info("Dienst gestartet")
     while True:
         with open(DATA / "bot.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = load_json(STATE, {})
+            state["running"] = None
+            run_now = apply_control(state)
             if state.get("login_required") and SESSION.exists() and SESSION.stat().st_mtime != state.get("session_mtime"):
                 log.info("Neue Session erkannt – Login-Sperre aufgehoben")
                 state.update(login_required=False, day=None)
             plan_day(state, now().date())
             due = dt.datetime.fromisoformat(state["next_run"])
-            if not (state["done"] or state["gave_up"] or state.get("paused") or state.get("login_required")) and now() >= due:
+            if run_now and not state.get("login_required"):
+                log.info("Manueller Lauf angefordert")
+                attempt(state, force=True)
+            elif not (state["done"] or state["gave_up"] or state.get("paused") or state.get("login_required")) \
+                    and now() >= due:
                 attempt(state)
             save_json(STATE, state)
-        time.sleep(min(300, max(5, (due - now()).total_seconds())) if now() < due else 300)
+        wait = (due - now()).total_seconds() if now() < due else 300
+        wake.wait(min(300, max(5, wait)))
+        wake.clear()
 
 
 def cmd_run_now(args):
@@ -425,20 +738,23 @@ def cmd_run_now(args):
         state = load_json(STATE, {})
         streak, skipped = run_once(state, force=args.force)
         print(f"Streak: {streak}" + (" (heute schon erledigt, übersprungen)" if skipped else " – Lesson erledigt"))
-        if not skipped:
-            state["done"] = state.get("day") == str(now().date()) or state.get("done", False)
+        record(state, "übersprungen" if skipped else "ok", "manuell über die Kommandozeile", streak)
+        if state.get("day") == str(now().date()):
+            state["done"] = True
         save_json(STATE, state)
 
 
 def cmd_status(args):
-    print(json.dumps(load_json(STATE, {}), indent=1, ensure_ascii=False))
+    cfg = load_settings()
+    cfg["ntfy_topic"] = "***" if cfg["ntfy_topic"] else ""
+    state = load_json(STATE, {})
+    state.pop("history", None)
+    print(json.dumps({"einstellungen": cfg, "zustand": state}, indent=1, ensure_ascii=False))
 
 
 def cmd_resume(args):
-    state = load_json(STATE, {})
-    state.update(paused=False, pause_reason=None, failed_days=0, login_required=False, day=None)
-    save_json(STATE, state)
-    print("Pause aufgehoben, Tagesplan wird neu gewürfelt.")
+    send_control(pause=False)
+    print("Fortsetzen angefordert – der Dienst übernimmt es innerhalb von 5 Minuten (sofort nach Neustart).")
 
 
 def main():
