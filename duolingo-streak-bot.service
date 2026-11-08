@@ -1,5 +1,5 @@
 [Unit]
-Description=DuolingoAutoStreak - taegliche Duolingo-Lesson
+Description=DuolingoAutoStreak - daily Duolingo lesson
 After=network-online.target
 Wants=network-online.target
 
