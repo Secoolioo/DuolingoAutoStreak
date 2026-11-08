@@ -268,14 +268,17 @@ def check_blockers(page):
     if LOGIN_URL.search(page.url):
         raise LoginRequired(f"Login-Seite erschienen ({page.url})")
     # Duolingo lädt auf jeder Seite ein unsichtbares reCAPTCHA – nur ein sichtbares ist eine Abfrage
-    for frame in page.frames:
-        if frame.parent_frame and SECURITY_FRAMES.search(frame.url or ""):
-            try:
-                shown = frame.frame_element().is_visible()
-            except Exception:
-                shown = False
-            if shown:
-                raise SecurityCheck(f"sichtbares Captcha ({frame.url.split('?')[0]})")
+    frames = page.locator("iframe")
+    for i in range(frames.count()):
+        el = frames.nth(i)
+        try:
+            ident = f"{el.get_attribute('src') or ''} {el.get_attribute('title') or ''}"
+            if SECURITY_FRAMES.search(ident) and el.is_visible():
+                raise SecurityCheck(f"sichtbares Captcha ({ident.split('?')[0].strip()})")
+        except SecurityCheck:
+            raise
+        except Exception:
+            continue
     try:
         body = page.locator("body").inner_text(timeout=3000)
     except Exception:
@@ -343,6 +346,8 @@ DISMISS = re.compile(r"^\s*(no thanks|not now|maybe later|later|got it|nein,? da
                      r"später|verstanden)\s*$", re.I)
 FINISH = re.compile(r"^\s*(continue|claim xp|weiter|xp einsammeln|ok)\s*$", re.I)
 BANK = '[data-test="word-bank"] [data-test$="challenge-tap-token"]'
+TEXT_OF = """e => (e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e)
+                 .innerText.trim().split('\\n').pop().trim()"""
 TOKEN = '[data-test$="challenge-tap-token"]'
 
 READ_CHALLENGE = """() => {
@@ -441,10 +446,12 @@ def visible(locator):
 
 
 def click_text(page, selector, text):
-    """Klickt das erste freie Element mit genau diesem Text."""
-    loc = page.locator(selector).filter(has_text=re.compile(rf"^\s*{re.escape(text)}\s*$"))
+    """Klickt das erste freie Element mit genau diesem Text (ohne Tastenkürzel-Nummer davor)."""
+    loc = page.locator(selector)
     for i in range(loc.count()):
         el = loc.nth(i)
+        if el.evaluate(TEXT_OF) != text:
+            continue
         if el.is_visible() and el.is_enabled() and el.get_attribute("aria-disabled") != "true":
             move_and_click(page, el)
             time.sleep(random.uniform(0.4, 1.2))
@@ -546,7 +553,14 @@ def do_lesson(page, bank, done_before=False):
             else:
                 unknown = 0
             human_pause()
-            what = answer(page, dom, ch)
+            try:
+                what = answer(page, dom, ch)
+            except RuntimeError as e:  # Element nicht gefunden: diese Aufgabe überspringen
+                unknown += 1
+                if unknown >= 3:
+                    raise
+                move_and_click(page, page.locator('[data-test="player-skip"]'))
+                what = f"übersprungen ({e})"
             human_pause(0.5, 1.5)
             click_next(page, 3000)  # Prüfen (bei Paaren evtl. nicht nötig)
             page.wait_for_timeout(random.randint(900, 1600))
@@ -571,9 +585,14 @@ def do_lesson(page, bank, done_before=False):
 
 
 STREAK_JS = """async ([id, jwt]) => {
-  const r = await fetch(`/2023-05-23/users/${id}?fields=streak,streakData`,
-                        {headers: {Authorization: `Bearer ${jwt}`}, credentials: 'include'});
-  return [r.status, await r.text()];
+  try {
+    const r = await fetch(`/2023-05-23/users/${id}?fields=streak,streakData`,
+                          {headers: {Authorization: `Bearer ${jwt}`}, credentials: 'include',
+                           signal: AbortSignal.timeout(15000)});
+    return [r.status, await r.text()];
+  } catch (e) {
+    return [0, String(e)];
+  }
 }"""
 
 
@@ -586,6 +605,11 @@ def read_streak(page):
     status, text = page.evaluate(STREAK_JS, [uid, jwt])
     if status in (401, 403):
         raise LoginRequired(f"API antwortet {status}")
+    if status == 0 and visible(page.locator('[data-test="loading-screen"]')):
+        # Ungültige Session: die Web-App bleibt bei "LOADING..." und die API antwortet nie
+        raise LoginRequired("Seite hängt beim Laden und die API antwortet nicht – Session ungültig")
+    if status != 200:
+        raise RuntimeError(f"Streak-Abfrage fehlgeschlagen ({status}: {text[:80]})")
     data = json.loads(text)
     current = (data.get("streakData") or {}).get("currentStreak") or {}
     return data.get("streak", 0), current.get("endDate") == str(now().date())
