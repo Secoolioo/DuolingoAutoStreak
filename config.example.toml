@@ -1,0 +1,4 @@
+# Auf dem Server nach data/config.toml kopieren (chmod 600). Das Topic ist das Geheimnis.
+[ntfy]
+server = "https://ntfy.sh"
+topic = "hier-ein-langes-zufaelliges-topic"

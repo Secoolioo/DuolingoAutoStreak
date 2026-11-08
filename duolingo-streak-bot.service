@@ -1,0 +1,23 @@
+[Unit]
+Description=DuolingoAutoStreak - taegliche Duolingo-Lesson
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=duobot
+Group=duobot
+WorkingDirectory=@DIR@
+Environment=HOME=@DIR@/data
+Environment=PLAYWRIGHT_BROWSERS_PATH=@DIR@/browsers
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@DIR@/.venv/bin/python @DIR@/bot.py serve
+Restart=always
+RestartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=@DIR@/data @DIR@/logs @DIR@/debug
+
+[Install]
+WantedBy=multi-user.target
