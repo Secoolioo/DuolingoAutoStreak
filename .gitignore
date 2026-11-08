@@ -1,0 +1,11 @@
+# Laufzeitdaten und Geheimnisse – niemals committen
+data/
+logs/
+debug/
+*session*.json
+config.toml
+deploy.env
+.venv/
+browsers/
+__pycache__/
+*.pyc
