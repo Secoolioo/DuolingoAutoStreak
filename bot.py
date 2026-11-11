@@ -38,7 +38,7 @@ CONTROL = DATA / "control.json"
 
 # Editable in the web UI, stored in data/settings.json
 DEFAULTS = {"window_start": "03:00", "window_end": "22:00", "last_chance": "23:00", "max_retries": 3,
-            "account": "", "notify_success": True, "ntfy_server": "https://ntfy.sh", "ntfy_topic": "",
+            "account": "", "notify_success": True, "api_fallback": True, "ntfy_server": "https://ntfy.sh", "ntfy_topic": "",
             "web_host": "0.0.0.0", "web_port": 8095}
 RETRY_GAP_MIN = (15, 75)
 MAX_SCREENSHOTS = 20
@@ -375,9 +375,20 @@ DISMISS = re.compile(r"^\s*(no thanks|not now|maybe later|later|got it|nein,? da
                      r"später|verstanden)\s*$", re.I)
 FINISH = re.compile(r"^\s*(continue|claim xp|weiter|xp einsammeln|ok)\s*$", re.I)
 BANK = '[data-test="word-bank"] [data-test$="challenge-tap-token"]'
-TEXT_OF = """e => (e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e)
-                 .innerText.trim().split('\\n').pop().trim()"""
 TOKEN = '[data-test$="challenge-tap-token"]'
+CHOICE = '[data-test="challenge-choice"]'
+# Visible text of an answer button, read two ways: multi-word buttons render one line per word, and choices
+# add a keyboard-shortcut digit that may sit on its own line or in the same line as the answer
+OPTION_TEXT = """e => {
+  const root = e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e;
+  const byLine = (root.innerText || '').split('\\n').map(s => s.trim()).filter(s => s && !/^\\d+$/.test(s)).join(' ');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), parts = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = n.textContent.trim();
+    if (t && !/^\\d+$/.test(t)) parts.push(t);
+  }
+  return [byLine, parts.join(' ')];
+}"""
 FEEDBACK = '[data-test*="blame"]'
 TRACE = None  # folder for a screenshot per step (run-now --trace)
 
@@ -385,8 +396,8 @@ READ_CHALLENGE = """() => {
   const ch = document.querySelector('[data-test~="challenge"]');
   if (!ch) return null;
   const type = (ch.getAttribute('data-test').split(' ').find(t => t.startsWith('challenge-')) || '').slice(10);
-  const txt = e => (e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e)
-                     .innerText.trim().split('\\n').pop();
+  const txt = e => ((e.querySelector('[data-test="challenge-tap-token-text"],[data-test="challenge-judge-text"]') || e)
+                     .innerText || '').split('\\n').map(s => s.trim()).filter(s => s && !/^\\d+$/.test(s)).join(' ');
   // The challenge, including its solution, is a prop on the challenge's React tree
   const fk = Object.keys(ch).find(k => k.startsWith('__reactFiber$'));
   const solved = v => v && typeof v === 'object' && !Array.isArray(v) && v.type &&
@@ -396,7 +407,7 @@ READ_CHALLENGE = """() => {
     const hit = Object.values(f.memoizedProps || {}).find(solved);
     if (hit) {
       data = {};
-      for (const k of ['type', 'prompt', 'choices', 'correctIndex', 'correctIndices', 'correctTokens',
+      for (const k of ['id', 'type', 'prompt', 'choices', 'correctIndex', 'correctIndices', 'correctTokens',
                        'correctSolutions', 'pairs', 'displayTokens']) if (k in hit) data[k] = hit[k];
       data = JSON.parse(JSON.stringify(data));
     }
@@ -405,15 +416,23 @@ READ_CHALLENGE = """() => {
           bank: [...document.querySelectorAll('[data-test="word-bank"] [data-test$="challenge-tap-token"]')].map(txt),
           tokens: [...document.querySelectorAll('[data-test$="challenge-tap-token"]')].map(txt),
           choices: [...document.querySelectorAll('[data-test="challenge-choice"]')].map(txt),
-          input: !!ch.querySelector('textarea, input[type="text"]')};
+          input: !!ch.querySelector('textarea, input[type="text"]'),
+          // every button of the challenge, for the log when a challenge cannot be solved
+          buttons: [...ch.querySelectorAll('button, [role="button"]')].map(e =>
+            (e.getAttribute('data-test') || e.tagName.toLowerCase()) + ': ' + txt(e)).slice(0, 20)};
 }"""
 
 
 def option_texts(ch):
+    """Answer texts of the choices: plain strings, or "text" (word banks) / "phrase" (picture cards)."""
     out = []
     for c in ch.get("choices") or []:
-        out.append(c if isinstance(c, str) else c.get("text", ""))
+        out.append(c if isinstance(c, str) else c.get("text") or c.get("phrase") or c.get("word") or "")
     return out
+
+
+def norm(text):
+    return re.sub(r"\s+", " ", text or "").strip().casefold().rstrip(".!?,;:")
 
 
 def tap_order(ch):
@@ -436,6 +455,8 @@ class ChallengeBank:
 
     def __init__(self, page):
         self.items = []
+        self.sessions = []    # raw session objects from POST /sessions (for the API fallback)
+        self.put_body = None  # what the app itself sends when it finishes a lesson
         self.submitted = False
         page.on("response", self._on_response)
         page.on("request", self._on_request)
@@ -444,15 +465,19 @@ class ChallengeBank:
         # End of a lesson: the app sends the session to /<version>/sessions/<id>
         if req.method in ("PUT", "POST") and SESSION_DONE.search(req.url.split("?")[0]):
             self.submitted = True
+            self.put_body = req.post_data
             log.info("Lesson submitted to Duolingo (%s)", req.method)
 
     def _on_response(self, resp):
         if resp.request.method != "POST" or not SESSION_API.search(resp.url.split("?")[0]):
             return
         try:
-            self._collect(resp.json())
+            body = resp.json()
         except Exception:
-            pass
+            return
+        if isinstance(body, dict) and body.get("id") and body.get("challenges"):
+            self.sessions.append(body)
+        self._collect(body)
 
     def _collect(self, node):
         if isinstance(node, dict):
@@ -472,9 +497,10 @@ class ChallengeBank:
             score, opts = 0, option_texts(ch)
             if isinstance(ch.get("prompt"), str) and ch["prompt"] and ch["prompt"] in dom["text"]:
                 score += 3
-            if opts and dom["bank"] and sorted(opts) == sorted(dom["bank"]):
+            opts = [norm(o) for o in opts]
+            if opts and dom["bank"] and sorted(opts) == sorted(map(norm, dom["bank"])):
                 score += 3
-            if opts and dom["choices"] and sorted(opts) == sorted(dom["choices"]):
+            if opts and dom["choices"] and sorted(opts) == sorted(map(norm, dom["choices"])):
                 score += 3
             words = {w for p in ch.get("pairs") or [] for w in p.values() if isinstance(w, str)}
             if words and dom["tokens"] and set(dom["tokens"]) <= words:
@@ -491,18 +517,77 @@ def visible(locator):
         return False
 
 
-def click_text(page, selector, text):
-    """Clicks the first free element with exactly this text (ignoring the keyboard-shortcut number)."""
-    loc = page.locator(selector)
-    for i in range(loc.count()):
-        el = loc.nth(i)
-        if el.evaluate(TEXT_OF) != text:
+def clickable(el):
+    return el.is_visible() and el.is_enabled() and el.get_attribute("aria-disabled") != "true"
+
+
+def find_option(page, text, index=None, count=None):
+    """The free answer button for `text`: by its data-test name, by its visible text, or by position."""
+    # Prefer the word bank: tokens already placed in the answer row look the same, and clicking one removes it
+    buttons = page.locator(BANK) if page.locator(BANK).count() else page.locator(f"{TOKEN}, {CHOICE}")
+    n = buttons.count()
+    # 1. Tap tokens carry their full text in data-test, also for several words ("gerade jetzt-challenge-tap-token")
+    for i in range(n):
+        el = buttons.nth(i)
+        if el.get_attribute("data-test") == f"{text}-challenge-tap-token" and clickable(el):
+            return el
+    # 2. Normalised visible text
+    want = norm(text)
+    for i in range(n):
+        el = buttons.nth(i)
+        if want in {norm(t) for t in el.evaluate(OPTION_TEXT)} and clickable(el):
+            return el
+    # 2b. Any other button of the challenge with that text (some answers are not regular tap tokens)
+    others = page.locator('[data-test~="challenge"] button, [data-test~="challenge"] [role="button"]')
+    for i in range(others.count()):
+        el = others.nth(i)
+        if (el.get_attribute("data-test") or "").startswith(("player-", "quit-")):
             continue
-        if el.is_visible() and el.is_enabled() and el.get_attribute("aria-disabled") != "true":
-            move_and_click(page, el)
-            time.sleep(random.uniform(0.4, 1.2))
-            return True
-    raise RuntimeError(f"no element with text {text!r}")
+        if want in {norm(t) for t in el.evaluate(OPTION_TEXT)} and clickable(el):
+            log.info("Answer %r found among other buttons (%s)", text, el.get_attribute("data-test"))
+            return el
+    # 3. Position – only for single-answer challenges and only if the number of buttons matches the data
+    if index is not None:
+        for group in (page.locator(CHOICE), buttons):
+            if group.count() == count and clickable(group.nth(index)):
+                log.info("Answer %r found by position %d", text, index)
+                return group.nth(index)
+    raise RuntimeError(f"no button for {text!r}")
+
+
+def click_option(page, text, index=None, count=None):
+    move_and_click(page, find_option(page, text, index, count))
+    time.sleep(random.uniform(0.4, 1.2))
+
+
+def blank_groups(ch):
+    """Missing words of a sentence, one entry per run of consecutive blanks."""
+    groups, cur = [], []
+    for t in ch.get("displayTokens") or []:
+        if t.get("isBlank"):
+            cur.append(t["text"])
+        elif cur and t.get("text", "").strip():
+            groups.append(" ".join(cur))
+            cur = []
+    if cur:
+        groups.append(" ".join(cur))
+    return groups
+
+
+def type_answer(page, ch):
+    """Typing challenges: one field per gap (fill in the blanks) or one field for the whole sentence."""
+    fields = page.locator('[data-test~="challenge"] textarea, [data-test~="challenge"] input[type="text"]')
+    gaps = blank_groups(ch)
+    if gaps and fields.count() == len(gaps):
+        texts = gaps
+    elif gaps and fields.count() == 1:
+        texts = [" ".join(gaps)]
+    else:
+        texts = [(ch.get("correctSolutions") or [ch.get("prompt", "")])[0]]
+    for i, text in enumerate(texts):
+        move_and_click(page, fields.nth(i))
+        human_type(page, text)
+    return "typed: " + " | ".join(texts)
 
 
 def click_next(page, timeout=6000):
@@ -548,30 +633,33 @@ def answer(page, dom, ch):
         return "skipped (no solution found)"
     if ch.get("pairs"):
         for p in ch["pairs"]:
-            a = p.get("learningToken") or p.get("learningWord")
-            b = p.get("fromToken") or p.get("translation")
-            click_text(page, TOKEN, a)
-            click_text(page, TOKEN, b)
+            click_option(page, p.get("learningToken") or p.get("learningWord"))
+            click_option(page, p.get("fromToken") or p.get("translation"))
         return "matched pairs"
-    if dom["bank"]:
-        order = tap_order(ch)
-        if not order:
-            raise RuntimeError(f"no tap order for {dom['type']}")
+    has_buttons = bool(dom["bank"] or dom["tokens"] or dom["choices"])
+    if dom["input"] and not has_buttons:
+        return type_answer(page, ch)
+    order = tap_order(ch)
+    if order and has_buttons:
+        single = len(order) == 1 and ch.get("correctIndex") is not None
         for word in order:
             human_pause(0.3, 1.2)
-            click_text(page, BANK, word)
-        return "word bank: " + " ".join(order)
-    if dom["choices"] and ch.get("correctIndex") is not None:
-        target = option_texts(ch)[ch["correctIndex"]]
-        click_text(page, '[data-test="challenge-choice"]', target)
-        return f"choice: {target}"
+            click_option(page, word, ch["correctIndex"] if single else None, len(option_texts(ch)))
+        return "tapped: " + " | ".join(order)
     if dom["input"]:
-        text = (ch.get("correctSolutions") or [ch.get("prompt", "")])[0]
-        move_and_click(page, page.locator('[data-test~="challenge"] textarea, [data-test~="challenge"] input[type="text"]').first)
-        human_type(page, text)
-        return f"typed: {text}"
-    move_and_click(page, page.locator('[data-test="player-skip"]'))
-    return "skipped (unknown layout)"
+        return type_answer(page, ch)
+    raise RuntimeError(f"no way to answer {dom['type']}")
+
+
+def describe(ch, dom):
+    """Short, URL-free summary of a challenge for the log."""
+    info = {k: (ch or {}).get(k) for k in ("prompt", "correctIndex", "correctIndices", "correctTokens", "correctSolutions")
+            if (ch or {}).get(k) is not None}
+    info["choices"] = option_texts(ch) if ch else None
+    info["blanks"] = blank_groups(ch) if ch else None
+    info["buttons"] = dom.get("buttons") or dom["bank"] or dom["choices"] or dom["tokens"]
+    info["input"] = dom["input"]
+    return json.dumps(info, ensure_ascii=False)[:700]
 
 
 def do_lesson(page, bank, done_before=False):
@@ -580,6 +668,8 @@ def do_lesson(page, bank, done_before=False):
     started = time.time()
     last_id = None
     unknown = answered = 0
+    failures = {}    # challenge -> how often it was skipped or answered wrong
+    reported = set()  # challenge types already documented with a screenshot in this run
     for step in range(MAX_STEPS):
         if time.time() - started > MAX_LESSON_S:
             raise RuntimeError(f"lesson not finished after {MAX_LESSON_S} s")
@@ -599,6 +689,8 @@ def do_lesson(page, bank, done_before=False):
                                                       if k != "text"}, ensure_ascii=False)[:300])
         if dom and dom["type"]:
             ch = dom["data"] if dom["data"] and dom["data"].get("type") == dom["type"] else bank.find(dom)
+            # Repeated mistakes come back with a "previous mistake" banner, so identify by the data, not the text
+            ident = (ch or {}).get("id") or (dom["type"], (ch or {}).get("prompt") or dom["text"][-80:])
             key = (dom["type"], dom["text"][:80])
             if key == last_id and ch is not None:
                 log.warning("Challenge repeats itself – skipping")
@@ -614,6 +706,10 @@ def do_lesson(page, bank, done_before=False):
             try:
                 what = answer(page, dom, ch)
             except Exception as e:  # e.g. element not found: skip just this challenge
+                if dom["type"] not in reported:
+                    reported.add(dom["type"])
+                    screenshot(page, f"unsolved-{dom['type']}")
+                    log.warning("Unsolved %s: %s", dom["type"], describe(ch, dom))
                 unknown += 1
                 if unknown >= 3:
                     raise
@@ -627,6 +723,10 @@ def do_lesson(page, bank, done_before=False):
             verdict = "correct" if visible(page.locator('[data-test*="blame-correct"]')) else \
                       "wrong" if visible(page.locator('[data-test*="blame-incorrect"]')) else "?"
             log.info("Step %d %s: %s → %s", step, dom["type"], what, verdict)
+            if verdict != "correct" and not what.startswith("turned off"):
+                failures[str(ident)] = failures.get(str(ident), 0) + 1
+                if failures[str(ident)] >= 2:  # Duolingo would ask it again and again – give up early
+                    raise RuntimeError(f"{dom['type']} failed twice ({what})")
             answered += 1
             click_next(page, 4000)  # continue
             continue
@@ -634,6 +734,9 @@ def do_lesson(page, bank, done_before=False):
         # follows are only promo and goal-picker screens, which we don't click at all.
         if answered and (bank.submitted or (not done_before and read_streak(page)[1])):
             log.info("Lesson finished after %d challenges", answered)
+            if TRACE and bank.put_body:
+                (TRACE / "put.json").write_text(bank.put_body)
+                log.info("Trace: lesson PUT body saved (%d bytes)", len(bank.put_body))
             return
         if not click_next(page, 2500):
             finish = page.get_by_role("button", name=FINISH)
@@ -675,8 +778,58 @@ def read_streak(page):
     return data.get("streak", 0), current.get("endDate") == str(now().date())
 
 
-def run_once(state, force=False):
-    """One complete attempt. Returns (streak, skipped) or raises."""
+PUT_JS = """async ([id, jwt, body]) => {
+  try {
+    const r = await fetch(`/2023-05-23/sessions/${id}`,
+                          {method: 'PUT', credentials: 'include', body: JSON.stringify(body),
+                           headers: {Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json'},
+                           signal: AbortSignal.timeout(30000)});
+    return [r.status, (await r.text()).slice(0, 300)];
+  } catch (e) {
+    return [0, String(e)];
+  }
+}"""
+# Not part of what the app sends back when it finishes a lesson
+NOT_SUBMITTED = ("adaptiveChallenges", "mistakesReplacementChallenges", "adaptiveInterleavedChallenges")
+
+
+def build_completion(session):
+    """A finished lesson in the shape the web app itself sends (measured from its own PUT request)."""
+    done = {k: v for k, v in session.items() if k not in NOT_SUBMITTED}
+    challenges = []
+    for ch in session.get("challenges") or []:
+        ch = dict(ch, correct=True, timeTaken=random.randint(3500, 14000))
+        guess = " ".join(tap_order(ch)) or (ch.get("correctSolutions") or [None])[0]
+        if guess:
+            ch["guess"] = guess
+        challenges.append(ch)
+    end = int(time.time())
+    done.update(
+        challenges=challenges, heartsLeft=0, startTime=end - random.randint(180, 360), endTime=end,
+        enableBonusPoints=True, failed=False, maxInLessonStreak=len(challenges), shouldLearnThings=True,
+        courseId=f"DUOLINGO_{session['learningLanguage'].upper()}_{session['fromLanguage'].upper()}",
+        dailyRefreshInfo=None,
+        pathLevelSpecifics={"skillId": session.get("skillId"), "crownLevelIndex": session.get("levelIndex", 0),
+                            "treeId": (session.get("metadata") or {}).get("skill_tree_id"), "nodeState": "active",
+                            "lessonNumber": None})
+    return done
+
+
+def complete_via_api(page, bank):
+    """Fallback: finish one of the lessons the app preloaded, through the same endpoint the app uses."""
+    sessions = [x for x in bank.sessions if x.get("type") == "LESSON"] or bank.sessions
+    if not sessions:
+        raise RuntimeError("API fallback: no preloaded lesson")
+    session = sessions[0]
+    jwt = next((c["value"] for c in page.context.cookies() if c["name"] == "jwt_token"), None)
+    status, text = page.evaluate(PUT_JS, [session["id"], jwt, build_completion(session)])
+    if status != 200:
+        raise RuntimeError(f"API fallback: server answered {status} ({text[:120]})")
+    log.info("API fallback: lesson %s submitted (%d challenges)", session["id"], len(session.get("challenges") or []))
+
+
+def run_once(state, force=False, fallback=False, api_only=False):
+    """One complete attempt. Returns (streak, skipped, method) or raises."""
     b = Browser(state)
     page = b.page
     bank = ChallengeBank(page)  # before the first page load, because /learn preloads the lessons
@@ -688,8 +841,24 @@ def run_once(state, force=False):
         streak, done_today = read_streak(page)
         if done_today and not force:
             log.info("Streak already extended today (%s days) – skipping", streak)
-            return streak, True
-        do_lesson(page, bank, done_today)
+            return streak, True, "none"
+        method = "api" if api_only else "ui"
+        if not api_only:
+            try:
+                do_lesson(page, bank, done_today)
+            except (LoginRequired, SecurityCheck):
+                raise
+            except Exception as e:
+                if not fallback:
+                    raise
+                log.warning("UI lesson failed (%s) – using the API fallback", e)
+                screenshot(page, "ui-failed")
+                method = "api"
+        if method == "api":
+            page.goto("https://www.duolingo.com/learn", wait_until="domcontentloaded")
+            page.wait_for_timeout(random.randint(4000, 7000))
+            check_blockers(page)
+            complete_via_api(page, bank)
         for _ in range(3):  # the server sometimes books the streak with a short delay
             page.goto("https://www.duolingo.com/learn", wait_until="domcontentloaded")
             page.wait_for_timeout(random.randint(4000, 7000))
@@ -698,7 +867,7 @@ def run_once(state, force=False):
                 break
         if not done_today:
             raise RuntimeError(f"lesson completed, but the streak is not marked as done today ({streak})")
-        return streak, False
+        return streak, False, method
     except Exception as e:
         shot = screenshot(page, type(e).__name__)
         e.screenshot = shot
@@ -720,17 +889,23 @@ def record(state, result, detail="", streak=None):
     state["history"] = state["history"][-60:]
 
 
-def attempt(state, force=False):
-    """One attempt including state, history and notifications."""
+def attempt(state, manual=False):
+    """One attempt including state, history and notifications. Manual runs ("Run now") always do a lesson,
+    may use the API fallback, and never count towards the day's attempts, retries or failed days."""
     cfg = load_settings()
     retries = int(cfg["max_retries"])
-    state["attempts"] = state.get("attempts", 0) + 1
-    n = state["attempts"]
-    log.info("Attempt %d/%d", n, retries + 1)
+    if manual:
+        n, last = 0, True
+        log.info("Manual run")
+    else:
+        state["attempts"] = state.get("attempts", 0) + 1
+        n = state["attempts"]
+        last = n > retries
+        log.info("Attempt %d/%d", n, retries + 1)
     state["running"] = now().isoformat(timespec="seconds")
     save_json(STATE, state)
     try:
-        streak, skipped = run_once(state, force)
+        streak, skipped, method = run_once(state, force=manual, fallback=bool(cfg["api_fallback"]) and last)
     except LoginRequired as e:
         log.error("Login required: %s", e)
         record(state, "login", str(e))
@@ -746,8 +921,12 @@ def attempt(state, force=False):
                "urgent", "warning", getattr(e, "screenshot", None))
         return
     except Exception as e:
-        log.exception("Attempt %d failed", n)
-        record(state, "error", f"{type(e).__name__}: {e}")
+        log.exception("Manual run failed" if manual else f"Attempt {n} failed")
+        record(state, "error", ("manual run: " if manual else "") + f"{type(e).__name__}: {e}")
+        if manual:
+            notify("Duolingo: manual run failed", f"{type(e).__name__}: {e}", "default", "x",
+                   getattr(e, "screenshot", None))
+            return
         nxt = retry_time(now(), retries + 1 - n, cfg) if n <= retries else None
         if nxt:
             state["next_run"] = nxt.isoformat()
@@ -767,9 +946,13 @@ def attempt(state, force=False):
     finally:
         state["running"] = None
     state.update(done=True, failed_days=0)
-    record(state, "skipped" if skipped else "ok", "already done today" if skipped else "lesson done", streak)
-    if not skipped and cfg["notify_success"]:
-        notify("Duolingo: streak saved", f"Lesson done. Streak: {streak} days.", "low", "fire")
+    if skipped:
+        record(state, "skipped", "already done today", streak)
+        return
+    via = " via the API fallback" if method == "api" else ""
+    record(state, "api" if method == "api" else "ok", ("manual run: " if manual else "") + "lesson done" + via, streak)
+    if cfg["notify_success"] or method == "api":
+        notify("Duolingo: streak saved", f"Lesson done{via}. Streak: {streak} days.", "low", "fire")
 
 
 def session_mtime():
@@ -816,8 +999,7 @@ def cmd_serve(args):
             plan_day(state, now().date())
             due = dt.datetime.fromisoformat(state["next_run"])
             if run_now and not state.get("login_required"):
-                log.info("Manual run requested")
-                attempt(state, force=True)
+                attempt(state, manual=True)
             elif not (state["done"] or state["gave_up"] or state.get("paused") or state.get("login_required")) \
                     and now() >= due:
                 attempt(state)
@@ -835,9 +1017,10 @@ def cmd_run_now(args):
     with open(DATA / "bot.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_json(STATE, {})
-        streak, skipped = run_once(state, force=args.force)
-        print(f"Streak: {streak}" + (" (already done today, skipped)" if skipped else " – lesson done"))
-        record(state, "skipped" if skipped else "ok", "manual run from the command line", streak)
+        streak, skipped, method = run_once(state, force=args.force, api_only=args.api_only)
+        print(f"Streak: {streak}" + (" (already done today, skipped)" if skipped else f" – lesson done ({method})"))
+        record(state, "skipped" if skipped else ("api" if method == "api" else "ok"),
+               "manual run from the command line", streak)
         if state.get("day") == str(now().date()):
             state["done"] = True
         save_json(STATE, state)
@@ -863,6 +1046,7 @@ def main():
     r = sub.add_parser("run-now")
     r.add_argument("--force", action="store_true", help="run even if today is already done")
     r.add_argument("--trace", action="store_true", help="save a screenshot per step to debug/trace/")
+    r.add_argument("--api-only", action="store_true", help="skip the UI and finish a lesson via the API fallback")
     r.set_defaults(fn=cmd_run_now)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("resume").set_defaults(fn=cmd_resume)

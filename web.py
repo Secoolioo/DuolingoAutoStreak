@@ -31,7 +31,7 @@ border-radius:8px;background:var(--bg);color:var(--fg)}input[type=checkbox]{widt
 pre{font-size:12px;overflow-x:auto;white-space:pre-wrap;margin:0}.msg{padding:8px 12px;border-radius:8px;background:var(--line);margin-bottom:14px}
 """
 
-RESULT = {"ok": ("ok", "Lesson done"), "skipped": ("ok", "Already done"), "error": ("bad", "Error"),
+RESULT = {"ok": ("ok", "Lesson done"), "api": ("ok", "Saved via API"), "skipped": ("ok", "Already done"), "error": ("bad", "Error"),
           "login": ("bad", "Login needed"), "captcha": ("bad", "Captcha")}
 HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 TOPIC = re.compile(r"^[A-Za-z0-9_-]{0,64}$")
@@ -171,7 +171,8 @@ class Handler(BaseHTTPRequestHandler):
         topic = form.get("ntfy_topic", "").strip()
         if topic != "***" and not TOPIC.match(topic):
             return "ntfy topic: letters, digits, - and _ only"
-        cfg.update(times, max_retries=retries, notify_success="notify_success" in form)
+        cfg.update(times, max_retries=retries, notify_success="notify_success" in form,
+                   api_fallback="api_fallback" in form)
         if topic != "***":
             cfg["ntfy_topic"] = topic
         b.save_json(b.SETTINGS, cfg)
@@ -227,6 +228,7 @@ class Handler(BaseHTTPRequestHandler):
         shot = '<a href=/screenshot target=_blank>last error screenshot</a>' if any(b.DEBUG.glob("*.png")) else ""
         topic = "***" if cfg["ntfy_topic"] else ""
         checked = "checked" if cfg["notify_success"] else ""
+        fallback = "checked" if cfg["api_fallback"] else ""
         who = esc(active["username"]) if active else "no account"
         streak = st.get("last_streak")
         return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -246,7 +248,8 @@ class Handler(BaseHTTPRequestHandler):
 <div><label>Last chance</label><input name=last_chance value="{esc(cfg['last_chance'])}"></div>
 <div><label>Retries</label><input name=max_retries type=number min=0 max=5 value="{esc(cfg['max_retries'])}"></div>
 <div><label>ntfy topic</label><input name=ntfy_topic value="{topic}" autocomplete=off></div>
-<div><label>Notify on success</label><input type=checkbox name=notify_success {checked}></div></div>
+<div><label>Notify on success</label><input type=checkbox name=notify_success {checked}></div>
+<div><label>API fallback (last attempt, Run now)</label><input type=checkbox name=api_fallback {fallback}></div></div>
 <div class=row><button class=pri>Save</button><a href=/ntfy><button type=button>Subscribe on phone</button></a></div></form></section>
 <section><details><summary class=mut>Log (last 30 lines)</summary><pre>{esc(log_tail)}</pre></details></section>
 </main></body></html>"""
